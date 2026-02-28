@@ -1,7 +1,7 @@
 {
     "name": "closedclaw",
-    "version": "0.1.0",
-    "description": "🔐 Encrypted credential vault and security layer for OpenClaw",
+    "version": "0.2.0",
+    "description": "Encrypted credential vault for OpenClaw",
     "type": "module",
     "main": "./dist/index.js",
     "types": "./dist/index.d.ts",
@@ -34,26 +34,15 @@
     ],
     "author": "ClosedClaw Team",
     "license": "MIT",
-    "repository": {
-        "type": "git",
-        "url": "git+https://github.com/closed-claw/closedclaw.git"
-    },
-    "homepage": "https://github.com/closed-claw/closedclaw#readme",
-    "bugs": {
-        "url": "https://github.com/closed-claw/closedclaw/issues"
-    },
     "engines": {
         "node": ">=20.0.0"
     },
     "dependencies": {
         "commander": "^12.1.0",
         "chalk": "^5.3.0",
-        "http-proxy": "^1.18.1",
-        "ora": "^8.0.1",
-        "inquirer": "^9.2.15"
+        "ora": "^8.0.1"
     },
     "devDependencies": {
-        "@types/http-proxy": "^1.17.14",
         "@types/node": "^20.11.0",
         "tsup": "^8.0.2",
         "typescript": "^5.3.3",

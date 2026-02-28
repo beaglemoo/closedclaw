@@ -12,18 +12,11 @@ export interface ClosedClawConfig {
         initialized: boolean;
         passphraseHash?: string;
         passphraseSalt?: string;
-        verificationPayload?: string; // Encrypted known value for passphrase verification
-    };
-    daemon: {
-        port: number;
-        host: string;
-        autoStart: boolean;
-        pidFile: string;
+        verificationPayload?: string;
     };
     openclaw: {
         configPath: string;
-        gatewayUrl: string;
-        gatewayPort: number;
+        authProfilesPath: string;
     };
 }
 
@@ -32,23 +25,16 @@ const DEFAULT_CONFIG: ClosedClawConfig = {
     vault: {
         initialized: false,
     },
-    daemon: {
-        port: 3847, // CLAW on phone keypad
-        host: '127.0.0.1',
-        autoStart: false,
-        pidFile: 'closedclaw.pid',
-    },
     openclaw: {
         configPath: join(homedir(), '.openclaw', 'openclaw.json'),
-        gatewayUrl: 'http://127.0.0.1',
-        gatewayPort: 3000,
+        authProfilesPath: join(homedir(), '.openclaw', 'auth-profiles.json'),
     },
 };
 
 export function getConfigDir(): string {
     const dir = join(homedir(), '.closedclaw');
     if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true, mode: 0o700 }); // Only owner can read/write
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
     return dir;
 }
@@ -80,7 +66,7 @@ export function loadConfig(): ClosedClawConfig {
 export function saveConfig(config: ClosedClawConfig): void {
     const configPath = getConfigPath();
     writeFileSync(configPath, JSON.stringify(config, null, 2), {
-        mode: 0o600, // Only owner can read/write
+        mode: 0o600,
     });
 }
 
