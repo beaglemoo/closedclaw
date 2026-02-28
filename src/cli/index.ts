@@ -430,4 +430,116 @@ program
         console.log();
     });
 
+// Exec provider command (OpenClaw SecretRef JSON protocol)
+program
+    .command('exec-provider')
+    .description('Run as OpenClaw exec secret provider (JSON stdin/stdout protocol)')
+    .option('--passphrase-file <path>', 'Read passphrase from file')
+    .action(async (options: { passphraseFile?: string }) => {
+        // Read JSON request from stdin
+        const input = await new Promise<string>((resolve) => {
+            let data = '';
+            process.stdin.setEncoding('utf8');
+            process.stdin.on('data', (chunk: string) => { data += chunk; });
+            process.stdin.on('end', () => resolve(data));
+            process.stdin.resume();
+        });
+
+        let request: { protocolVersion?: number; provider?: string; ids?: string[] };
+        try {
+            request = JSON.parse(input);
+        } catch {
+            const errorResponse = {
+                protocolVersion: 1,
+                values: {},
+                errors: { _: { message: 'Invalid JSON request on stdin' } },
+            };
+            process.stdout.write(JSON.stringify(errorResponse));
+            process.exit(1);
+        }
+
+        if (request.protocolVersion !== 1 || !Array.isArray(request.ids)) {
+            const errorResponse = {
+                protocolVersion: 1,
+                values: {},
+                errors: { _: { message: 'Invalid protocol version or missing ids array' } },
+            };
+            process.stdout.write(JSON.stringify(errorResponse));
+            process.exit(1);
+        }
+
+        if (!isVaultInitialized()) {
+            const errorResponse = {
+                protocolVersion: 1,
+                values: {},
+                errors: Object.fromEntries(
+                    request.ids.map(id => [id, { message: 'Vault not initialized' }])
+                ),
+            };
+            process.stdout.write(JSON.stringify(errorResponse));
+            process.exit(1);
+        }
+
+        const passphrase = await resolvePassphrase(options);
+
+        // Check lockout
+        const lockoutSeconds = checkLockout();
+        if (lockoutSeconds !== null) {
+            const errorResponse = {
+                protocolVersion: 1,
+                values: {},
+                errors: Object.fromEntries(
+                    request.ids.map(id => [id, { message: `Locked out for ${lockoutSeconds}s` }])
+                ),
+            };
+            process.stdout.write(JSON.stringify(errorResponse));
+            process.exit(1);
+        }
+
+        const vault = getVault();
+        if (!vault.unlock(passphrase)) {
+            recordFailure();
+            auditLog('vault_unlock', undefined, 'exec-provider failed');
+            const errorResponse = {
+                protocolVersion: 1,
+                values: {},
+                errors: Object.fromEntries(
+                    request.ids.map(id => [id, { message: 'Authentication failed' }])
+                ),
+            };
+            process.stdout.write(JSON.stringify(errorResponse));
+            process.exit(1);
+        }
+
+        resetLockout();
+
+        try {
+            const values: Record<string, string> = {};
+            const errors: Record<string, { message: string }> = {};
+
+            for (const id of request.ids) {
+                const credential = vault.getCredential(id);
+                if (credential) {
+                    values[id] = credential.key;
+                    auditLog('credential_get', id, 'exec-provider');
+                } else {
+                    errors[id] = { message: 'Secret not found' };
+                }
+            }
+
+            const response: Record<string, unknown> = {
+                protocolVersion: 1,
+                values,
+            };
+
+            if (Object.keys(errors).length > 0) {
+                response.errors = errors;
+            }
+
+            process.stdout.write(JSON.stringify(response));
+        } finally {
+            vault.lock();
+        }
+    });
+
 program.parse();

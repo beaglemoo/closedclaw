@@ -7,15 +7,17 @@ ClosedClaw stores API keys and service credentials in an AES-256-GCM encrypted v
 ## How It Works
 
 ```
-OpenClaw skill needs credentials
-  -> SecretRef: exec "closedclaw get overseerr-api-key"
-  -> ClosedClaw decrypts vault, outputs key to stdout
-  -> OpenClaw injects it as env var (e.g., OVERSEERR_API_KEY)
-  -> Skill runs with the credential
-  -> Env var cleaned up after execution
+OpenClaw needs credentials for a skill
+  -> Spawns: closedclaw exec-provider
+  -> Sends JSON request on stdin: { ids: ["overseerr-api-key"] }
+  -> ClosedClaw decrypts vault, returns JSON on stdout
+  -> OpenClaw holds credentials in memory (never written to disk)
+  -> Injects as env var for skill execution
+  -> Env var cleaned up in finally block after skill runs
 ```
 
 ClosedClaw is a pure CLI tool. No daemon, no proxy, no HTTP server.
+Credentials are never stored in plaintext on disk.
 
 ## Quick Start
 
@@ -39,45 +41,75 @@ closedclaw list
 
 ## OpenClaw Integration
 
-Configure OpenClaw's `openclaw.json` to use ClosedClaw via SecretRef exec:
+### Step 1: Configure ClosedClaw as a secrets provider
+
+Add to `openclaw.json`:
+
+```json
+{
+  "secrets": {
+    "defaults": {
+      "exec": "closedclaw"
+    },
+    "providers": {
+      "closedclaw": {
+        "source": "exec",
+        "command": "/usr/local/bin/closedclaw",
+        "args": ["exec-provider", "--passphrase-file", "/root/.closedclaw/passphrase"],
+        "jsonOnly": true,
+        "timeoutMs": 30000
+      }
+    }
+  }
+}
+```
+
+### Step 2: Map skills to SecretRef
+
+For single-credential skills (e.g., Overseerr with `primaryEnv: OVERSEERR_API_KEY`):
 
 ```json
 {
   "skills": {
     "entries": {
       "overseerr": {
+        "apiKey": {
+          "source": "exec",
+          "provider": "closedclaw",
+          "id": "overseerr-api-key"
+        },
         "env": {
-          "OVERSEERR_URL": "http://192.168.0.221:5055",
-          "OVERSEERR_API_KEY": {
-            "$ref": "exec:closedclaw get overseerr-api-key --passphrase-file /root/.closedclaw/passphrase"
-          }
-        }
-      },
-      "proxmox-ops": {
-        "env": {
-          "PROXMOX_HOST": "https://192.168.0.61:8006",
-          "PROXMOX_TOKEN_ID": {
-            "$ref": "exec:closedclaw get proxmox-token-id --passphrase-file /root/.closedclaw/passphrase"
-          },
-          "PROXMOX_TOKEN_SECRET": {
-            "$ref": "exec:closedclaw get proxmox-token-secret --passphrase-file /root/.closedclaw/passphrase"
-          }
-        }
-      },
-      "uptime-kuma": {
-        "env": {
-          "UPTIME_KUMA_URL": "http://192.168.0.33:3001",
-          "UPTIME_KUMA_USERNAME": {
-            "$ref": "exec:closedclaw get uptime-kuma-username --passphrase-file /root/.closedclaw/passphrase"
-          },
-          "UPTIME_KUMA_PASSWORD": {
-            "$ref": "exec:closedclaw get uptime-kuma-password --passphrase-file /root/.closedclaw/passphrase"
-          }
+          "OVERSEERR_URL": "http://192.168.0.221:5055"
         }
       }
     }
   }
 }
+```
+
+For multi-credential skills (e.g., Uptime Kuma needing username + password),
+set system env vars loaded from ClosedClaw at boot via systemd:
+
+```bash
+# /etc/systemd/system/closedclaw-env.service
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'echo "UPTIME_KUMA_USERNAME=$(closedclaw get uptime-kuma-username --passphrase-file /root/.closedclaw/passphrase)" >> /etc/openclaw-secrets.env'
+ExecStart=/bin/bash -c 'echo "UPTIME_KUMA_PASSWORD=$(closedclaw get uptime-kuma-password --passphrase-file /root/.closedclaw/passphrase)" >> /etc/openclaw-secrets.env'
+```
+
+### Exec Provider Protocol
+
+The `exec-provider` command speaks OpenClaw's JSON stdin/stdout protocol:
+
+**Request (stdin):**
+```json
+{ "protocolVersion": 1, "provider": "closedclaw", "ids": ["overseerr-api-key", "proxmox-token-id"] }
+```
+
+**Response (stdout):**
+```json
+{ "protocolVersion": 1, "values": { "overseerr-api-key": "abc123", "proxmox-token-id": "user@pve!token" } }
 ```
 
 ## CLI Commands
@@ -89,7 +121,10 @@ Initialize a new encrypted vault with a master passphrase.
 Store a credential. If key is omitted, prompts with hidden input (recommended).
 
 ### `closedclaw get <provider>`
-Retrieve a credential value. Outputs raw key to stdout for SecretRef exec integration. All errors go to stderr.
+Retrieve a single credential value. Outputs raw key to stdout. All errors go to stderr.
+
+### `closedclaw exec-provider`
+Run as an OpenClaw exec secret provider. Reads JSON request from stdin, returns JSON response on stdout. Used by OpenClaw's SecretRef system internally.
 
 Options:
 - `--passphrase-file <path>` - Read passphrase from a file (must be mode 0600/0400)
