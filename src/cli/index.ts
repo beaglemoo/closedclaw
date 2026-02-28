@@ -9,6 +9,7 @@ import { createInterface } from 'node:readline';
 import { readFileSync, statSync } from 'node:fs';
 import { getVault } from '../vault/vault.js';
 import { loadConfig, saveConfig, isVaultInitialized } from '../core/config.js';
+import { auditLog, readAuditLog } from '../core/audit.js';
 
 const program = new Command();
 
@@ -137,6 +138,7 @@ program
         try {
             const vault = getVault();
             vault.initialize(passphrase);
+            auditLog('vault_init');
             spinner.succeed('Vault initialized successfully!');
 
             console.log(chalk.green('\nYour encrypted vault is ready.\n'));
@@ -187,6 +189,7 @@ program
 
         try {
             vault.storeCredential(provider, key);
+            auditLog('credential_store', provider);
             spinner.succeed(`${provider} credentials stored securely.`);
             console.log(chalk.green(`\n${provider} credential encrypted and saved.\n`));
         } catch (error) {
@@ -224,6 +227,8 @@ program
                 process.stderr.write(`Error: No credential found for "${provider}".\n`);
                 process.exit(1);
             }
+
+            auditLog('credential_get', provider);
 
             // Output raw key to stdout (no newline, no formatting, no colors)
             process.stdout.write(credential.key);
@@ -291,6 +296,7 @@ program
 
         try {
             if (vault.deleteCredential(provider)) {
+                auditLog('credential_delete', provider);
                 console.log(chalk.green(`\n${provider} credentials deleted.\n`));
             } else {
                 console.log(chalk.yellow(`\nNo credentials found for ${provider}.\n`));
@@ -344,6 +350,31 @@ program
             console.log(JSON.stringify(config, null, 2));
             console.log();
         }
+    });
+
+// Audit command
+program
+    .command('audit')
+    .description('View recent audit log entries')
+    .option('-n, --limit <number>', 'Number of entries to show', '20')
+    .action((options) => {
+        const limit = parseInt(options.limit, 10) || 20;
+        const entries = readAuditLog(limit);
+
+        if (entries.length === 0) {
+            console.log(chalk.yellow('\nNo audit log entries found.\n'));
+            return;
+        }
+
+        console.log(chalk.bold(`\nRecent Audit Log (last ${entries.length} entries):\n`));
+        for (const entry of entries) {
+            const time = chalk.gray(entry.timestamp);
+            const action = chalk.cyan(entry.action);
+            const provider = entry.provider ? chalk.white(` [${entry.provider}]`) : '';
+            const detail = entry.detail ? chalk.gray(` ${entry.detail}`) : '';
+            console.log(`  ${time}  ${action}${provider}${detail}`);
+        }
+        console.log();
     });
 
 program.parse();

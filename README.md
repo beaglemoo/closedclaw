@@ -1,157 +1,161 @@
-# 🔐 ClosedClaw
+# ClosedClaw
 
-> **Encrypted Credential Vault & Security Layer for OpenClaw**
+> Encrypted Credential Vault for OpenClaw
 
-ClosedClaw protects your API keys and sensitive credentials by storing them in an AES-256-GCM encrypted vault. It runs as a daemon that sits between you and OpenClaw, injecting credentials at runtime without ever storing them in plaintext.
+ClosedClaw stores API keys and service credentials in an AES-256-GCM encrypted vault. It integrates with OpenClaw's SecretRef system to provide credentials on demand, without storing them in plaintext.
 
-## 🚀 Quick Start
+## How It Works
+
+```
+OpenClaw skill needs credentials
+  -> SecretRef: exec "closedclaw get overseerr-api-key"
+  -> ClosedClaw decrypts vault, outputs key to stdout
+  -> OpenClaw injects it as env var (e.g., OVERSEERR_API_KEY)
+  -> Skill runs with the credential
+  -> Env var cleaned up after execution
+```
+
+ClosedClaw is a pure CLI tool. No daemon, no proxy, no HTTP server.
+
+## Quick Start
 
 ```bash
-# Install globally
-npm install -g closedclaw
-
 # Initialize your vault
 closedclaw init
 
-# Store your API keys
-closedclaw store anthropic sk-ant-api03-xxxxx
-closedclaw store openai sk-xxxxx
-closedclaw store elevenlabs xxxxx
+# Store credentials (interactive, hidden input)
+closedclaw store overseerr-api-key
+closedclaw store proxmox-token-id
+closedclaw store proxmox-token-secret
+closedclaw store uptime-kuma-username
+closedclaw store uptime-kuma-password
 
-# Start the daemon
-closedclaw start
+# Retrieve a credential
+closedclaw get overseerr-api-key --passphrase-file ~/.closedclaw/passphrase
 
-# Check status
-closedclaw status
+# List stored providers
+closedclaw list
 ```
 
-## 📖 How It Works
+## OpenClaw Integration
 
+Configure OpenClaw's `openclaw.json` to use ClosedClaw via SecretRef exec:
+
+```json
+{
+  "skills": {
+    "entries": {
+      "overseerr": {
+        "env": {
+          "OVERSEERR_URL": "http://192.168.0.221:5055",
+          "OVERSEERR_API_KEY": {
+            "$ref": "exec:closedclaw get overseerr-api-key --passphrase-file /root/.closedclaw/passphrase"
+          }
+        }
+      },
+      "proxmox-ops": {
+        "env": {
+          "PROXMOX_HOST": "https://192.168.0.61:8006",
+          "PROXMOX_TOKEN_ID": {
+            "$ref": "exec:closedclaw get proxmox-token-id --passphrase-file /root/.closedclaw/passphrase"
+          },
+          "PROXMOX_TOKEN_SECRET": {
+            "$ref": "exec:closedclaw get proxmox-token-secret --passphrase-file /root/.closedclaw/passphrase"
+          }
+        }
+      },
+      "uptime-kuma": {
+        "env": {
+          "UPTIME_KUMA_URL": "http://192.168.0.33:3001",
+          "UPTIME_KUMA_USERNAME": {
+            "$ref": "exec:closedclaw get uptime-kuma-username --passphrase-file /root/.closedclaw/passphrase"
+          },
+          "UPTIME_KUMA_PASSWORD": {
+            "$ref": "exec:closedclaw get uptime-kuma-password --passphrase-file /root/.closedclaw/passphrase"
+          }
+        }
+      }
+    }
+  }
+}
 ```
-┌──────────────┐      ┌───────────────┐      ┌──────────────┐
-│   You/Apps   │ ───▶ │  ClosedClaw   │ ───▶ │   OpenClaw   │
-│              │      │   (Daemon)    │      │   Gateway    │
-└──────────────┘      └───────────────┘      └──────────────┘
-                              │
-                              ▼
-                      ┌───────────────┐
-                      │  Encrypted    │
-                      │    Vault      │
-                      │  (AES-256)    │
-                      └───────────────┘
-```
 
-1. **Initialize**: Create an encrypted vault with your master passphrase
-2. **Store**: Add API keys - they're encrypted immediately
-3. **Start**: Launch the daemon, unlock with your passphrase
-4. **Use**: The daemon injects credentials into OpenClaw requests
-
-## 🛡️ Security Features
-
-| Feature | Description |
-|---------|-------------|
-| **AES-256-GCM** | Military-grade encryption for all stored data |
-| **scrypt KDF** | Passphrase-derived keys with high memory cost |
-| **Secure Permissions** | Files created with 0600 mode (owner-only) |
-| **Memory Safety** | Credentials cleared from memory when locked |
-| **No Plaintext** | API keys never written to disk unencrypted |
-
-## 📋 CLI Commands
+## CLI Commands
 
 ### `closedclaw init`
-Initialize a new encrypted vault. You'll create a master passphrase.
+Initialize a new encrypted vault with a master passphrase.
 
-### `closedclaw store <provider> <key>`
-Store an API key for a provider (e.g., `anthropic`, `openai`, `elevenlabs`).
+### `closedclaw store <provider> [key]`
+Store a credential. If key is omitted, prompts with hidden input (recommended).
+
+### `closedclaw get <provider>`
+Retrieve a credential value. Outputs raw key to stdout for SecretRef exec integration. All errors go to stderr.
+
+Options:
+- `--passphrase-file <path>` - Read passphrase from a file (must be mode 0600/0400)
 
 ### `closedclaw list`
-List all stored providers (keys are never displayed).
+List all stored credential provider names (keys are never displayed).
 
 ### `closedclaw delete <provider>`
 Remove a stored credential.
 
-### `closedclaw start [-f|--foreground]`
-Start the daemon. Use `-f` to run in foreground.
-
-### `closedclaw stop`
-Stop the running daemon.
-
 ### `closedclaw status`
-Show vault and daemon status.
+Show vault initialization status and configuration.
 
-### `closedclaw config [options]`
+### `closedclaw config`
 View or update configuration.
-- `--daemon-port <port>`: Set ClosedClaw's port (default: 3847)
-- `--openclaw-port <port>`: Set OpenClaw gateway port (default: 3000)
+- `--auth-profiles-path <path>` - Set path to OpenClaw's auth-profiles.json
+- `--openclaw-config <path>` - Set path to OpenClaw config file
 
-## ⚙️ Configuration
+### `closedclaw audit`
+View recent audit log entries.
+- `-n, --limit <number>` - Number of entries to show (default: 20)
 
-ClosedClaw stores its config at `~/.closedclaw/config.json`:
+## Passphrase Resolution
 
-```json
-{
-  "daemon": {
-    "port": 3847,
-    "host": "127.0.0.1"
-  },
-  "openclaw": {
-    "gatewayUrl": "http://127.0.0.1",
-    "gatewayPort": 3000
-  }
-}
-```
+The passphrase is resolved in this order:
+1. `--passphrase-file <path>` flag (file must be mode 0600 or 0400)
+2. `CLOSEDCLAW_PASSPHRASE` environment variable
+3. Interactive prompt (hidden input)
 
-## 🔧 Integration with OpenClaw
+## Security
 
-Update your OpenClaw configuration to use ClosedClaw as the gateway:
+| Feature | Description |
+|---------|-------------|
+| AES-256-GCM | Authenticated encryption for all stored data |
+| scrypt KDF | Passphrase-derived keys with high memory cost (N=16384) |
+| Secure Permissions | Files created with 0600 mode (owner-only) |
+| Memory Safety | Vault locked after every operation |
+| No Plaintext | Credentials never written to disk unencrypted |
+| Audit Trail | All credential access logged to audit.log |
 
-```json
-{
-  "gateway": {
-    "port": 3847
-  }
-}
-```
-
-Or set the environment variable:
-```bash
-export OPENCLAW_GATEWAY_URL=http://127.0.0.1:3847
-```
-
-## 📁 File Locations
+## File Locations
 
 | File | Location | Purpose |
 |------|----------|---------|
-| Config | `~/.closedclaw/config.json` | Settings & preferences |
+| Config | `~/.closedclaw/config.json` | Settings |
 | Vault | `~/.closedclaw/vault.enc` | Encrypted credentials |
-| PID | `~/.closedclaw/closedclaw.pid` | Daemon process ID |
+| Audit | `~/.closedclaw/audit.log` | Access log |
+| Passphrase | `~/.closedclaw/passphrase` | Optional passphrase file for non-interactive use |
 
-## 🏗️ Development
+## Deployment
 
 ```bash
-# Clone the repo
-git clone https://github.com/closedclaw/closedclaw.git
-cd closedclaw
-
-# Install dependencies
-pnpm install
-
-# Run in dev mode
-pnpm dev
-
-# Build
-pnpm build
-
-# Test
-pnpm test
+# Deploy to OpenClaw LXC
+./deploy/deploy.sh
 ```
 
-## 📜 License
+## Development
 
-MIT © ClosedClaw Team
+```bash
+npm install
+npm run dev      # Watch mode
+npm run build    # Production build
+npm test         # Run tests
+npm run typecheck
+```
 
----
+## License
 
-<p align="center">
-  <b>🦞 OpenClaw + 🔐 ClosedClaw = Secure AI</b>
-</p>
+MIT
