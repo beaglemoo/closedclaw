@@ -6,10 +6,11 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import ora from 'ora';
 import { createInterface } from 'node:readline';
-import { readFileSync, statSync } from 'node:fs';
+import { lstatSync, readFileSync } from 'node:fs';
 import { getVault } from '../vault/vault.js';
 import { loadConfig, saveConfig, isVaultInitialized } from '../core/config.js';
 import { auditLog, readAuditLog } from '../core/audit.js';
+import { checkLockout, recordFailure, resetLockout } from '../core/lockout.js';
 
 const program = new Command();
 
@@ -21,7 +22,9 @@ const logo = `
 `;
 
 /**
- * Prompt for password (hidden input)
+ * Prompt for password (hidden input).
+ * Note: JavaScript strings are immutable and cannot be reliably wiped from
+ * memory. The returned string may persist until garbage collected.
  */
 async function promptPassword(prompt: string): Promise<string> {
     const rl = createInterface({
@@ -76,12 +79,27 @@ async function resolvePassphrase(options: { passphraseFile?: string }): Promise<
     // Option 1: passphrase file
     if (options.passphraseFile) {
         try {
-            const stats = statSync(options.passphraseFile);
-            const mode = stats.mode & 0o777;
-            if (mode !== 0o600 && mode !== 0o400) {
-                process.stderr.write(`Error: Passphrase file permissions are too open (${mode.toString(8)}). Must be 0600 or 0400.\n`);
+            const stats = lstatSync(options.passphraseFile);
+
+            // Reject symlinks
+            if (stats.isSymbolicLink()) {
+                process.stderr.write('Error: Passphrase file must not be a symlink.\n');
                 process.exit(1);
             }
+
+            // Check ownership
+            if (stats.uid !== process.getuid?.()) {
+                process.stderr.write('Error: Passphrase file must be owned by the current user.\n');
+                process.exit(1);
+            }
+
+            // Check permissions - reject if group or other have any access
+            if ((stats.mode & 0o077) !== 0) {
+                const mode = (stats.mode & 0o777).toString(8);
+                process.stderr.write(`Error: Passphrase file permissions are too open (${mode}). No group/other access allowed.\n`);
+                process.exit(1);
+            }
+
             return readFileSync(options.passphraseFile, 'utf8').trim();
         } catch (err) {
             if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
@@ -93,11 +111,57 @@ async function resolvePassphrase(options: { passphraseFile?: string }): Promise<
 
     // Option 2: environment variable
     if (process.env.CLOSEDCLAW_PASSPHRASE) {
-        return process.env.CLOSEDCLAW_PASSPHRASE;
+        process.stderr.write('Warning: Reading passphrase from environment variable. This may be visible to other processes.\n');
+        const passphrase = process.env.CLOSEDCLAW_PASSPHRASE;
+        // Clear from environment immediately
+        delete process.env.CLOSEDCLAW_PASSPHRASE;
+        return passphrase;
     }
 
     // Option 3: interactive prompt
     return promptPassword(chalk.white('Enter passphrase: '));
+}
+
+// Clean up env var on exit as a safety net
+process.on('exit', () => {
+    delete process.env.CLOSEDCLAW_PASSPHRASE;
+});
+
+/**
+ * Attempt to unlock the vault with lockout protection.
+ * Returns true on success, exits the process on failure.
+ */
+async function unlockVaultWithProtection(
+    passphrase: string,
+    options: { useGenericErrors?: boolean } = {}
+): Promise<boolean> {
+    // Check lockout
+    const lockoutSeconds = checkLockout();
+    if (lockoutSeconds !== null) {
+        const msg = `Too many failed attempts. Try again in ${lockoutSeconds} seconds.`;
+        if (options.useGenericErrors) {
+            process.stderr.write(`Error: ${msg}\n`);
+        } else {
+            console.log(chalk.red(`\n${msg}`));
+        }
+        auditLog('vault_unlock', undefined, 'locked out');
+        process.exit(1);
+    }
+
+    const vault = getVault();
+    if (!vault.unlock(passphrase)) {
+        recordFailure();
+        auditLog('vault_unlock', undefined, 'failed');
+        if (options.useGenericErrors) {
+            process.stderr.write('Error: Authentication failed.\n');
+        } else {
+            console.log(chalk.red('\nAuthentication failed.'));
+        }
+        process.exit(1);
+    }
+
+    resetLockout();
+    return true;
 }
 
 program
@@ -178,13 +242,9 @@ program
         }
 
         const passphrase = await resolvePassphrase(options);
+        await unlockVaultWithProtection(passphrase);
+
         const vault = getVault();
-
-        if (!vault.unlock(passphrase)) {
-            console.log(chalk.red('\nInvalid passphrase.'));
-            process.exit(1);
-        }
-
         const spinner = ora(`Storing ${provider} credentials...`).start();
 
         try {
@@ -202,29 +262,28 @@ program
     });
 
 // Get command (for SecretRef exec integration)
+// Uses generic error messages to avoid leaking information about vault contents
 program
     .command('get <provider>')
     .description('Retrieve a credential value (outputs to stdout for SecretRef exec)')
     .option('--passphrase-file <path>', 'Read passphrase from file')
     .action(async (provider: string, options: { passphraseFile?: string }) => {
         if (!isVaultInitialized()) {
-            process.stderr.write('Error: Vault is not initialized. Run "closedclaw init" first.\n');
+            process.stderr.write('Error: Authentication failed.\n');
             process.exit(1);
         }
 
         const passphrase = await resolvePassphrase(options);
-        const vault = getVault();
+        await unlockVaultWithProtection(passphrase, { useGenericErrors: true });
 
-        if (!vault.unlock(passphrase)) {
-            process.stderr.write('Error: Invalid passphrase.\n');
-            process.exit(1);
-        }
+        const vault = getVault();
 
         try {
             const credential = vault.getCredential(provider);
 
             if (!credential) {
-                process.stderr.write(`Error: No credential found for "${provider}".\n`);
+                // Generic error - don't reveal whether provider exists or passphrase was wrong
+                process.stderr.write('Error: Authentication failed.\n');
                 process.exit(1);
             }
 
@@ -249,12 +308,9 @@ program
         }
 
         const passphrase = await resolvePassphrase(options);
-        const vault = getVault();
+        await unlockVaultWithProtection(passphrase);
 
-        if (!vault.unlock(passphrase)) {
-            console.log(chalk.red('\nInvalid passphrase.'));
-            process.exit(1);
-        }
+        const vault = getVault();
 
         try {
             const providers = vault.listProviders();
@@ -287,12 +343,9 @@ program
         }
 
         const passphrase = await resolvePassphrase(options);
-        const vault = getVault();
+        await unlockVaultWithProtection(passphrase);
 
-        if (!vault.unlock(passphrase)) {
-            console.log(chalk.red('\nInvalid passphrase.'));
-            process.exit(1);
-        }
+        const vault = getVault();
 
         try {
             if (vault.deleteCredential(provider)) {

@@ -17,6 +17,8 @@ import {
     saveConfig,
 } from '../core/config.js';
 
+const PROVIDER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/;
+
 export interface Credential {
     provider: string;
     key: string;
@@ -36,9 +38,25 @@ export interface VaultData {
 
 const VERIFICATION_VALUE = 'CLOSEDCLAW_VAULT_OK';
 
+function validateProvider(provider: string): void {
+    if (!provider || !PROVIDER_NAME_PATTERN.test(provider)) {
+        throw new Error('Invalid provider name. Use alphanumeric characters, hyphens, underscores, and dots (1-64 chars).');
+    }
+}
+
+/**
+ * Clear a Buffer by filling with zeros.
+ */
+function clearBuffer(buf: Buffer | null): void {
+    if (buf) {
+        buf.fill(0);
+    }
+}
+
 export class Vault {
     private unlocked: boolean = false;
-    private passphrase: string | null = null;
+    // Store passphrase as Buffer for explicit memory clearing
+    private passphraseBuffer: Buffer | null = null;
     private data: VaultData | null = null;
 
     /**
@@ -64,7 +82,6 @@ export class Vault {
             throw new Error('Vault is already initialized. Use reset() to reinitialize.');
         }
 
-        // Create empty vault data
         const now = Date.now();
         const vaultData: VaultData = {
             version: 1,
@@ -96,7 +113,7 @@ export class Vault {
         saveConfig(config);
 
         // Auto-unlock after initialization
-        this.passphrase = passphrase;
+        this.passphraseBuffer = Buffer.from(passphrase, 'utf8');
         this.data = vaultData;
         this.unlocked = true;
     }
@@ -131,7 +148,7 @@ export class Vault {
             const payload: EncryptedPayload = JSON.parse(encryptedContent);
             const decrypted = decrypt(payload, passphrase);
             this.data = JSON.parse(decrypted);
-            this.passphrase = passphrase;
+            this.passphraseBuffer = Buffer.from(passphrase, 'utf8');
             this.unlocked = true;
             return true;
         } catch {
@@ -140,11 +157,12 @@ export class Vault {
     }
 
     /**
-     * Lock the vault
+     * Lock the vault - clears all sensitive data from memory
      */
     lock(): void {
         this.unlocked = false;
-        this.passphrase = null;
+        clearBuffer(this.passphraseBuffer);
+        this.passphraseBuffer = null;
         this.data = null;
     }
 
@@ -153,6 +171,7 @@ export class Vault {
      */
     storeCredential(provider: string, key: string, metadata?: Record<string, string>): void {
         this.ensureUnlocked();
+        validateProvider(provider);
 
         const now = Date.now();
         const existing = this.data!.credentials.find(c => c.provider === provider);
@@ -180,6 +199,7 @@ export class Vault {
      */
     getCredential(provider: string): Credential | null {
         this.ensureUnlocked();
+        validateProvider(provider);
         return this.data!.credentials.find(c => c.provider === provider) ?? null;
     }
 
@@ -196,6 +216,7 @@ export class Vault {
      */
     deleteCredential(provider: string): boolean {
         this.ensureUnlocked();
+        validateProvider(provider);
         const index = this.data!.credentials.findIndex(c => c.provider === provider);
         if (index === -1) return false;
 
@@ -206,7 +227,7 @@ export class Vault {
     }
 
     /**
-     * Get all credentials (for injection into OpenClaw config)
+     * Get all credentials
      */
     getAllCredentials(): Credential[] {
         this.ensureUnlocked();
@@ -249,7 +270,8 @@ export class Vault {
         config.vault.verificationPayload = JSON.stringify(verificationPayload);
         saveConfig(config);
 
-        this.passphrase = newPassphrase;
+        clearBuffer(this.passphraseBuffer);
+        this.passphraseBuffer = Buffer.from(newPassphrase, 'utf8');
         return true;
     }
 
@@ -260,9 +282,10 @@ export class Vault {
     }
 
     private saveVault(): void {
-        if (!this.passphrase || !this.data) return;
+        if (!this.passphraseBuffer || !this.data) return;
 
-        const encrypted = encrypt(JSON.stringify(this.data), this.passphrase);
+        const passphrase = this.passphraseBuffer.toString('utf8');
+        const encrypted = encrypt(JSON.stringify(this.data), passphrase);
         writeFileSync(getVaultPath(), JSON.stringify(encrypted), {
             mode: 0o600,
         });
