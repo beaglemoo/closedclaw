@@ -32,9 +32,9 @@ ${RSYNC} -avz --delete \
     ./ "${TARGET_HOST}:${TARGET_DIR}/"
 echo "  Sync complete."
 
-# Step 3: Install production dependencies on target
+# Step 3: Install production dependencies and fix ownership on target
 echo "[3/5] Installing production dependencies on target..."
-ssh ${TARGET_HOST} "cd ${TARGET_DIR} && npm install --production --ignore-scripts 2>&1 | tail -3"
+ssh ${TARGET_HOST} "chown -R root:root ${TARGET_DIR} && cd ${TARGET_DIR} && npm install --production --ignore-scripts 2>&1 | tail -3"
 echo "  Dependencies installed."
 
 # Step 4: Create symlink
