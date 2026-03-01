@@ -6,18 +6,33 @@ ClosedClaw stores API keys and service credentials in an AES-256-GCM encrypted v
 
 ## How It Works
 
+ClosedClaw is a pure CLI tool. No daemon, no proxy, no HTTP server.
+
+### Single-Credential Skills (Exec Provider)
+
+For skills with a `primaryEnv` / `apiKey` field (e.g., Overseerr):
+
 ```
 OpenClaw needs credentials for a skill
   -> Spawns: closedclaw exec-provider
   -> Sends JSON request on stdin: { ids: ["overseerr-api-key"] }
   -> ClosedClaw decrypts vault, returns JSON on stdout
-  -> OpenClaw holds credentials in memory (never written to disk)
-  -> Injects as env var for skill execution
-  -> Env var cleaned up in finally block after skill runs
+  -> OpenClaw injects as env var for skill execution
+  -> Env var cleaned up after skill runs
 ```
 
-ClosedClaw is a pure CLI tool. No daemon, no proxy, no HTTP server.
-Credentials are never stored in plaintext on disk.
+### Multi-Credential Skills (SystemD EnvironmentFile)
+
+For skills needing multiple credentials (e.g., Uptime Kuma with username + password), where the `env` field doesn't support SecretRef:
+
+```
+Gateway service starts
+  -> ExecStartPre runs load-env.sh
+  -> load-env.sh reads secrets from vault via closedclaw get
+  -> Writes to EnvironmentFile (mode 0600, atomic write via mktemp + mv)
+  -> Gateway inherits env vars, skill scripts inherit from gateway
+  -> No plaintext credentials in openclaw.json
+```
 
 ## Quick Start
 
@@ -27,8 +42,6 @@ closedclaw init
 
 # Store credentials (interactive, hidden input)
 closedclaw store overseerr-api-key
-closedclaw store proxmox-token-id
-closedclaw store proxmox-token-secret
 closedclaw store uptime-kuma-username
 closedclaw store uptime-kuma-password
 
@@ -48,13 +61,10 @@ Add to `openclaw.json`:
 ```json
 {
   "secrets": {
-    "defaults": {
-      "exec": "closedclaw"
-    },
     "providers": {
       "closedclaw": {
         "source": "exec",
-        "command": "/usr/local/bin/closedclaw",
+        "command": "/opt/closedclaw/bin/closedclaw.js",
         "args": ["exec-provider", "--passphrase-file", "/root/.closedclaw/passphrase"],
         "jsonOnly": true,
         "timeoutMs": 30000
@@ -64,9 +74,9 @@ Add to `openclaw.json`:
 }
 ```
 
-### Step 2: Map skills to SecretRef
+### Step 2: Map single-credential skills to SecretRef
 
-For single-credential skills (e.g., Overseerr with `primaryEnv: OVERSEERR_API_KEY`):
+For skills with a `primaryEnv` field (like Overseerr):
 
 ```json
 {
@@ -87,16 +97,39 @@ For single-credential skills (e.g., Overseerr with `primaryEnv: OVERSEERR_API_KE
 }
 ```
 
-For multi-credential skills (e.g., Uptime Kuma needing username + password),
-set system env vars loaded from ClosedClaw at boot via systemd:
+### Step 3: Multi-credential skills via EnvironmentFile
 
+For skills needing multiple credentials, a loader script reads secrets from the vault at service start:
+
+**Loader script** (`~/.closedclaw/load-env.sh`, mode 0700):
 ```bash
-# /etc/systemd/system/closedclaw-env.service
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'echo "UPTIME_KUMA_USERNAME=$(closedclaw get uptime-kuma-username --passphrase-file /root/.closedclaw/passphrase)" >> /etc/openclaw-secrets.env'
-ExecStart=/bin/bash -c 'echo "UPTIME_KUMA_PASSWORD=$(closedclaw get uptime-kuma-password --passphrase-file /root/.closedclaw/passphrase)" >> /etc/openclaw-secrets.env'
+#!/bin/bash
+set -euo pipefail
+
+VAULT="/opt/closedclaw/bin/closedclaw.js"
+PF="/root/.closedclaw/passphrase"
+ENV="/root/.closedclaw/openclaw-env"
+
+TMPENV=$(mktemp "${ENV}.XXXXXX")
+trap 'rm -f "$TMPENV"' EXIT
+
+echo "UPTIME_KUMA_URL=http://192.168.0.33:3001" > "$TMPENV"
+echo "UPTIME_KUMA_USERNAME=$(node $VAULT get uptime-kuma-username --passphrase-file $PF)" >> "$TMPENV"
+echo "UPTIME_KUMA_PASSWORD=$(node $VAULT get uptime-kuma-password --passphrase-file $PF)" >> "$TMPENV"
+
+chmod 600 "$TMPENV"
+mv "$TMPENV" "$ENV"
+trap - EXIT
 ```
+
+**SystemD service additions:**
+```ini
+[Service]
+ExecStartPre=/root/.closedclaw/load-env.sh
+EnvironmentFile=/root/.closedclaw/openclaw-env
+```
+
+The skill's `env` in `openclaw.json` only needs non-sensitive config. The gateway process inherits the sensitive vars from the EnvironmentFile, and skill scripts inherit them from the gateway.
 
 ### Exec Provider Protocol
 
@@ -104,66 +137,51 @@ The `exec-provider` command speaks OpenClaw's JSON stdin/stdout protocol:
 
 **Request (stdin):**
 ```json
-{ "protocolVersion": 1, "provider": "closedclaw", "ids": ["overseerr-api-key", "proxmox-token-id"] }
+{ "protocolVersion": 1, "provider": "closedclaw", "ids": ["overseerr-api-key"] }
 ```
 
 **Response (stdout):**
 ```json
-{ "protocolVersion": 1, "values": { "overseerr-api-key": "abc123", "proxmox-token-id": "user@pve!token" } }
+{ "protocolVersion": 1, "values": { "overseerr-api-key": "abc123" } }
 ```
+
+Supports batch retrieval with per-credential error reporting.
 
 ## CLI Commands
 
-### `closedclaw init`
-Initialize a new encrypted vault with a master passphrase.
+| Command | Description |
+|---------|-------------|
+| `closedclaw init` | Initialize a new encrypted vault with master passphrase |
+| `closedclaw store <provider> [key]` | Store a credential (prompts for hidden input if key omitted) |
+| `closedclaw get <provider>` | Retrieve raw credential value to stdout |
+| `closedclaw exec-provider` | OpenClaw exec provider (JSON stdin/stdout protocol) |
+| `closedclaw list` | List stored credential provider names |
+| `closedclaw delete <provider>` | Remove a stored credential |
+| `closedclaw status` | Show vault status and configuration |
+| `closedclaw config` | View/update configuration paths |
+| `closedclaw audit [-n N]` | View recent audit log entries (default: 20) |
 
-### `closedclaw store <provider> [key]`
-Store a credential. If key is omitted, prompts with hidden input (recommended).
+### Passphrase Resolution
 
-### `closedclaw get <provider>`
-Retrieve a single credential value. Outputs raw key to stdout. All errors go to stderr.
-
-### `closedclaw exec-provider`
-Run as an OpenClaw exec secret provider. Reads JSON request from stdin, returns JSON response on stdout. Used by OpenClaw's SecretRef system internally.
-
-Options:
-- `--passphrase-file <path>` - Read passphrase from a file (must be mode 0600/0400)
-
-### `closedclaw list`
-List all stored credential provider names (keys are never displayed).
-
-### `closedclaw delete <provider>`
-Remove a stored credential.
-
-### `closedclaw status`
-Show vault initialization status and configuration.
-
-### `closedclaw config`
-View or update configuration.
-- `--auth-profiles-path <path>` - Set path to OpenClaw's auth-profiles.json
-- `--openclaw-config <path>` - Set path to OpenClaw config file
-
-### `closedclaw audit`
-View recent audit log entries.
-- `-n, --limit <number>` - Number of entries to show (default: 20)
-
-## Passphrase Resolution
-
-The passphrase is resolved in this order:
-1. `--passphrase-file <path>` flag (file must be mode 0600 or 0400)
-2. `CLOSEDCLAW_PASSPHRASE` environment variable
-3. Interactive prompt (hidden input)
+Commands resolve the passphrase in priority order:
+1. `--passphrase-file <path>` -- file must be mode 0600 or 0400, no symlinks
+2. `CLOSEDCLAW_PASSPHRASE` environment variable (deleted from env after use)
+3. Interactive prompt (hidden input via TTY)
 
 ## Security
 
-| Feature | Description |
-|---------|-------------|
-| AES-256-GCM | Authenticated encryption for all stored data |
-| scrypt KDF | Passphrase-derived keys with high memory cost (N=16384) |
-| Secure Permissions | Files created with 0600 mode (owner-only) |
-| Memory Safety | Vault locked after every operation |
-| No Plaintext | Credentials never written to disk unencrypted |
-| Audit Trail | All credential access logged to audit.log |
+| Feature | Implementation |
+|---------|---------------|
+| Encryption | AES-256-GCM (authenticated encryption) |
+| Key Derivation | scrypt (N=16384, r=8, p=1) |
+| File Permissions | All files created with 0600 (owner-only) |
+| Memory Safety | Passphrase stored as Buffer, zeroed on lock |
+| Audit Trail | All credential access logged (NDJSON) |
+| Rate Limiting | Exponential backoff after 5 failed attempts (30s to 5min) |
+| Timing Safety | `timingSafeEqual()` for hash comparison |
+| Generic Errors | Avoids leaking credential existence |
+| Passphrase File | Rejects symlinks, wrong ownership, group/other permissions |
+| EnvironmentFile | Mode 0600, atomic writes, regenerated from vault on restart |
 
 ## File Locations
 
@@ -171,8 +189,11 @@ The passphrase is resolved in this order:
 |------|----------|---------|
 | Config | `~/.closedclaw/config.json` | Settings |
 | Vault | `~/.closedclaw/vault.enc` | Encrypted credentials |
-| Audit | `~/.closedclaw/audit.log` | Access log |
 | Passphrase | `~/.closedclaw/passphrase` | Optional passphrase file for non-interactive use |
+| Audit | `~/.closedclaw/audit.log` | Access log |
+| Lockout | `~/.closedclaw/lockout.json` | Rate limiting state |
+| Env Loader | `~/.closedclaw/load-env.sh` | Vault-to-env loader script |
+| Env File | `~/.closedclaw/openclaw-env` | Generated env vars (regenerated on restart) |
 
 ## Deployment
 
@@ -180,6 +201,8 @@ The passphrase is resolved in this order:
 # Deploy to OpenClaw LXC
 ./deploy/deploy.sh
 ```
+
+The script builds, rsyncs to the LXC, installs production deps, deploys the env loader script, and creates the `/usr/local/bin/closedclaw` symlink.
 
 ## Development
 
